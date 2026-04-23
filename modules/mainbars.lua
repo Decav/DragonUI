@@ -740,6 +740,9 @@ end
     -- We don't rely on MainMenuExpBar:IsShown() because noop kills the
     -- Blizzard events that manage that state.
     local function IsXpBarVisible()
+        -- Respect the user's hide toggle first
+        local cfg = GetXpRepConfig()
+        if cfg and cfg.hide_xpbar then return false end
         local maxXP = UnitXPMax("player")
         if not maxXP or maxXP <= 0 then return false end
         local currXP = UnitXP("player") or 0
@@ -1135,13 +1138,12 @@ end
         if not dfRepBar then return end
 
         local name, standing, minRep, maxRep, value = GetWatchedFactionInfo()
-        if not name then
+        local cfg = GetXpRepConfig() or {}
+        if not name or (cfg.hide_repbar) then
             dfRepBar:Hide()
             return
         end
         dfRepBar:Show()
-
-        local cfg = GetXpRepConfig() or {}
 
         -- Standing-based texture color
         if standing == 1 or standing == 2 then
@@ -1591,7 +1593,27 @@ end
                 addon.ActionBarFrames.xpbar:Hide()
             end
         end
-    end
+
+        -- ========== REP BAR VISIBILITY ==========
+        -- hide_repbar toggle: hide the entire rep bar container.
+        -- Also hides the Blizzard ReputationWatchBar for RetailUI style.
+        local repCfg = GetXpRepConfig() or {}
+        if addon.ActionBarFrames.repbar then
+            if repCfg.hide_repbar then
+                addon.ActionBarFrames.repbar:Hide()
+                if style == "retailui" and ReputationWatchBar then
+                    ReputationWatchBar:Hide()
+                end
+            else
+                -- Visibility is controlled per-frame by UpdateDragonflightUIRepBar /
+                -- Blizzard events for RetailUI; just ensure the container is not hidden.
+                addon.ActionBarFrames.repbar:Show()
+                if style == "retailui" and ReputationWatchBar then
+                    ReputationWatchBar:Show()
+                end
+            end
+        end
+    end -- UpdateBarPositions
 
     -- ========== EXPORTED REFRESH / CALLBACK FUNCTIONS ==========
     -- These are called from options.lua and tab_xprepbars.lua

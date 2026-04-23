@@ -275,6 +275,9 @@ local defaults = {
             always_show_text = false,
             show_xp_percent = false,
             show_rep_text_on_hover = true,
+            -- Visibility overrides
+            hide_xpbar = false,
+            hide_repbar = false,
         },
 
         style = {

@@ -226,7 +226,121 @@ end
 
 -- Forward declarations for editor system (defined/assigned later)
 local ApplySelectionTint, ClearSelectionTint
+local ApplyGroupTint, ClearGroupTint
 local editorPanel, selectedEditorFrame
+
+-- ============================================================================
+-- SNAP GROUPS (session-only: cleared when editor closes)
+-- ============================================================================
+-- Groups let multiple frames move together when any member is dragged.
+-- Groups are NOT persisted to the database — they must be re-created each
+-- editor session.  This keeps the feature simple and side-effect free.
+local snapGroups   = {}    -- { [groupId] = { frame1, frame2, ... } }
+local frameToGroup = {}    -- { [frame]   = groupId }
+local nextGroupId  = 1
+local snapLinkMode = false -- true while waiting for user to click a second frame
+
+local function GetNewGroupId()
+    local id = nextGroupId
+    nextGroupId = nextGroupId + 1
+    return id
+end
+
+-- Save a frame's position through the EditableFrames registry
+local function SaveSnapFramePosition(frame)
+    if not addon.EditableFrames then return end
+    for _, frameData in pairs(addon.EditableFrames) do
+        if frameData.frame == frame and frameData.configPath then
+            if #frameData.configPath == 2 then
+                addon.SaveUIFramePosition(frame, frameData.configPath[1], frameData.configPath[2])
+            else
+                addon.SaveUIFramePosition(frame, frameData.configPath[1])
+            end
+            return
+        end
+    end
+end
+
+-- Remove a frame from its snap group; disbands the group if only 1 member left
+local function RemoveFrameFromGroup(frame)
+    local groupId = frameToGroup[frame]
+    if not groupId then return end
+    frameToGroup[frame] = nil
+    local group = snapGroups[groupId]
+    if not group then return end
+    for i, f in ipairs(group) do
+        if f == frame then
+            table.remove(group, i)
+            break
+        end
+    end
+    if #group <= 1 then
+        if group[1] then
+            frameToGroup[group[1]] = nil
+            if ClearGroupTint then ClearGroupTint(group[1]) end
+        end
+        snapGroups[groupId] = nil
+    end
+    if ClearGroupTint then ClearGroupTint(frame) end
+end
+
+-- Link two frames into the same snap group (merges their groups if needed)
+local function LinkFrames(frameA, frameB)
+    if frameA == frameB then return false end
+    local groupA = frameToGroup[frameA]
+    local groupB = frameToGroup[frameB]
+    if groupA and groupB then
+        if groupA == groupB then return false end -- already linked
+        -- Merge groupB into groupA
+        for _, f in ipairs(snapGroups[groupB] or {}) do
+            frameToGroup[f] = groupA
+            table.insert(snapGroups[groupA], f)
+        end
+        snapGroups[groupB] = nil
+    elseif groupA then
+        frameToGroup[frameB] = groupA
+        table.insert(snapGroups[groupA], frameB)
+    elseif groupB then
+        frameToGroup[frameA] = groupB
+        table.insert(snapGroups[groupB], frameA)
+    else
+        local newId = GetNewGroupId()
+        snapGroups[newId] = { frameA, frameB }
+        frameToGroup[frameA] = newId
+        frameToGroup[frameB] = newId
+    end
+    -- Refresh group tints on all non-selected members
+    local gid = frameToGroup[frameA]
+    if gid and snapGroups[gid] and ApplyGroupTint then
+        for _, f in ipairs(snapGroups[gid]) do
+            if f ~= addon.selectedEditorFrame then
+                ApplyGroupTint(f)
+            end
+        end
+    end
+    return true
+end
+
+-- Return all group members for a frame except the frame itself (nil if none)
+local function GetGroupPeers(frame)
+    local groupId = frameToGroup[frame]
+    if not groupId or not snapGroups[groupId] then return nil end
+    local peers = {}
+    for _, f in ipairs(snapGroups[groupId]) do
+        if f ~= frame then table.insert(peers, f) end
+    end
+    return (#peers > 0) and peers or nil
+end
+
+-- Clear all snap groups and tints (called when editor closes)
+local function ClearAllSnapGroups()
+    for frame, _ in pairs(frameToGroup) do
+        if ClearGroupTint then ClearGroupTint(frame) end
+    end
+    snapGroups   = {}
+    frameToGroup = {}
+    snapLinkMode = false
+end
 
 -- Create a UI frame with editor mode support
 function addon.CreateUIFrame(width, height, frameName)
@@ -238,6 +352,19 @@ function addon.CreateUIFrame(width, height, frameName)
     frame:SetMovable(false)
     
     frame:SetScript("OnDragStart", function(self, button)
+        -- Capture snap-group origins using absolute screen coords (GetLeft/GetBottom).
+        -- We intentionally avoid GetPoint(1) here because anchor types vary per frame
+        -- (BOTTOMLEFT, BOTTOMRIGHT, CENTER, ...) and mixing those coordinate spaces
+        -- produces wrong deltas. GetLeft/GetBottom are always in UIParent screen-pixels.
+        local peers = GetGroupPeers(self)
+        if peers then
+            self._snapDragOriginScreen = { x = self:GetLeft() or 0, y = self:GetBottom() or 0 }
+            self._snapPeerOrigins = {}
+            for _, peer in ipairs(peers) do
+                local pp, pr, prp, px, py = peer:GetPoint(1)
+                self._snapPeerOrigins[peer] = { point = pp or "CENTER", rTo = pr, rPoint = prp or "CENTER", x = px or 0, y = py or 0 }
+            end
+        end
         self:StartMoving()
         -- Ensure this frame is the selected one
         if selectedEditorFrame ~= self then
@@ -249,7 +376,24 @@ function addon.CreateUIFrame(width, height, frameName)
     
     frame:SetScript("OnDragStop", function(self)
         self:StopMovingOrSizing()
-        
+
+        -- Propagate drag delta to snap group peers.
+        -- Delta is computed in screen coordinates (GetLeft/GetBottom) so it is
+        -- independent of each frame's anchor type. Because WoW SetPoint offsets
+        -- always increase rightward/upward regardless of anchor name, we can add
+        -- the screen-space delta directly to the stored anchor offsets.
+        if self._snapDragOriginScreen and self._snapPeerOrigins then
+            local dx = (self:GetLeft() or 0) - self._snapDragOriginScreen.x
+            local dy = (self:GetBottom() or 0) - self._snapDragOriginScreen.y
+            for peer, origin in pairs(self._snapPeerOrigins) do
+                peer:ClearAllPoints()
+                peer:SetPoint(origin.point, origin.rTo or UIParent, origin.rPoint, origin.x + dx, origin.y + dy)
+                SaveSnapFramePosition(peer)
+            end
+            self._snapDragOriginScreen = nil
+            self._snapPeerOrigins      = nil
+        end
+
         -- AUTO-SAVE: Find this frame in EditableFrames and save position automatically
         for name, frameData in pairs(addon.EditableFrames) do
             if frameData.frame == self then
@@ -269,6 +413,17 @@ function addon.CreateUIFrame(width, height, frameName)
     -- Click without drag also selects the frame
     frame:SetScript("OnMouseDown", function(self, button)
         if button == "LeftButton" then
+            -- In link mode: link clicked frame to the selected anchor frame.
+            -- Link mode stays ACTIVE so the user can keep clicking more frames
+            -- to add them all to the same group without pressing "Link" again.
+            if snapLinkMode and selectedEditorFrame and selectedEditorFrame ~= self then
+                LinkFrames(selectedEditorFrame, self)
+                -- Refresh link button label (stays in link mode)
+                if editorPanel and editorPanel.linkButton then
+                    editorPanel.linkButton:SetText("+ Add more / Done")
+                end
+                return
+            end
             addon.SelectEditorFrame(self)
         end
     end)
@@ -573,6 +728,18 @@ local function NudgeSelectedFrame(dx, dy)
     if not point then return end
     selectedEditorFrame:ClearAllPoints()
     selectedEditorFrame:SetPoint(point, relativeTo, relativePoint, (posX or 0) + dx, (posY or 0) + dy)
+    -- Propagate nudge to snap group peers
+    local peers = GetGroupPeers(selectedEditorFrame)
+    if peers then
+        for _, peer in ipairs(peers) do
+            local pp, pr, prp, px, py = peer:GetPoint(1)
+            if pp then
+                peer:ClearAllPoints()
+                peer:SetPoint(pp, pr or UIParent, prp, (px or 0) + dx, (py or 0) + dy)
+                SaveSnapFramePosition(peer)
+            end
+        end
+    end
     -- Auto-save position
     if addon.EditableFrames then
         for _, frameData in pairs(addon.EditableFrames) do
@@ -594,7 +761,7 @@ local function CreateEditorControlPanel()
     if editorPanel then return editorPanel end
 
     local panel = CreateFrame("Frame", "DragonUI_EditorPanel", UIParent)
-    panel:SetSize(180, 80)
+    panel:SetSize(180, 116)
     panel:SetPoint("TOP", UIParent, "TOP", 0, -10)
     panel:SetFrameStrata("TOOLTIP")
     panel:SetFrameLevel(200)
@@ -703,6 +870,36 @@ local function CreateEditorControlPanel()
     yPlus:SetFrameLevel(panel:GetFrameLevel() + 5)
     yPlus:SetScript("OnClick", function() NudgeSelectedFrame(0, 1) end)
 
+    -- Link / Unlink button (snap group row)
+    local linkButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    linkButton:SetSize(164, 22)
+    linkButton:SetPoint("TOPLEFT", yLabel, "BOTTOMLEFT", -5, -10)
+    linkButton:SetText("Link")
+    linkButton:SetFrameLevel(panel:GetFrameLevel() + 5)
+    linkButton:SetScript("OnClick", function()
+        if not selectedEditorFrame then return end
+        if snapLinkMode then
+            -- Second press: exit link mode (done adding frames)
+            snapLinkMode = false
+            -- Recompute label based on whether frame is now in a group
+            if frameToGroup[selectedEditorFrame] then
+                linkButton:SetText("Unlink")
+            else
+                linkButton:SetText("Link")
+            end
+        elseif frameToGroup[selectedEditorFrame] then
+            -- Frame is already in a group: remove it
+            RemoveFrameFromGroup(selectedEditorFrame)
+            linkButton:SetText("Link")
+        else
+            -- Enter link mode: click frames to add them all to the same group.
+            -- Press "Done" (this button again) when finished.
+            snapLinkMode = true
+            linkButton:SetText("Click frames... (Done)")
+        end
+    end)
+    panel.linkButton = linkButton
+
     -- Continuous coordinate polling while the panel is visible.
     -- This is simpler and more reliable than per-frame OnUpdate scripts
     -- since it works for every frame type (CreateUIFrame, lootroll, quest, etc.)
@@ -737,21 +934,47 @@ ClearSelectionTint = function(frame)
     end
 end
 
+-- Apply orange tint to nineslice to mark a grouped-but-not-selected frame
+ApplyGroupTint = function(frame)
+    local slice = frame and frame.NineSlice
+    if not slice then return end
+    if slice.Center then slice.Center:SetVertexColor(1.0, 0.55, 0.0, 0.45) end
+    for _, key in ipairs({"TopLeftCorner", "TopRightCorner", "BottomLeftCorner", "BottomRightCorner",
+                          "TopEdge", "BottomEdge", "LeftEdge", "RightEdge"}) do
+        if slice[key] then slice[key]:SetVertexColor(1.0, 0.55, 0.0) end
+    end
+end
+
+-- Remove group tint (same as clearing selection — returns to white vertex color)
+ClearGroupTint = function(frame)
+    local slice = frame and frame.NineSlice
+    if not slice then return end
+    if slice.Center then slice.Center:SetVertexColor(1, 1, 1, 1) end
+    for _, key in ipairs({"TopLeftCorner", "TopRightCorner", "BottomLeftCorner", "BottomRightCorner",
+                          "TopEdge", "BottomEdge", "LeftEdge", "RightEdge"}) do
+        if slice[key] then slice[key]:SetVertexColor(1, 1, 1) end
+    end
+end
+
 -- Select a frame for coordinate display and nudging
 function addon.SelectEditorFrame(frame)
-    -- Deselect previous
+    -- Deselect previous frame: restore group tint if it belongs to a snap group
     if selectedEditorFrame and selectedEditorFrame ~= frame then
         if selectedEditorFrame.NineSlice then
             ClearSelectionTint(selectedEditorFrame)
             SetNinesliceState(selectedEditorFrame, false)
+            if frameToGroup[selectedEditorFrame] then
+                ApplyGroupTint(selectedEditorFrame)
+            end
         end
     end
 
     selectedEditorFrame = frame
     addon.selectedEditorFrame = frame
 
-    -- Show selected nineslice state with green tint
+    -- Show selected nineslice state with green tint (overrides group tint)
     if frame.NineSlice then
+        ClearGroupTint(frame)
         SetNinesliceState(frame, true)
         ApplySelectionTint(frame)
     end
@@ -772,6 +995,16 @@ function addon.SelectEditorFrame(frame)
     end
     panel.nameLabel:SetText(displayName or "Frame")
     UpdateEditorPanelCoords()
+    -- Update link button state
+    if panel.linkButton then
+        if snapLinkMode then
+            panel.linkButton:SetText("Click frames... (Done)")
+        elseif frameToGroup[frame] then
+            panel.linkButton:SetText("Unlink")
+        else
+            panel.linkButton:SetText("Link")
+        end
+    end
     panel:Show()
 end
 
@@ -785,13 +1018,21 @@ function addon.DeselectEditorFrame()
     if selectedEditorFrame and selectedEditorFrame.NineSlice then
         ClearSelectionTint(selectedEditorFrame)
         SetNinesliceState(selectedEditorFrame, false)
+        -- Restore group tint if this frame still belongs to a snap group
+        if frameToGroup[selectedEditorFrame] then
+            ApplyGroupTint(selectedEditorFrame)
+        end
     end
     selectedEditorFrame = nil
     addon.selectedEditorFrame = nil
+    snapLinkMode = false
     if editorPanel then
         editorPanel.nameLabel:SetText("\226\128\148")
         editorPanel.xValue:SetText("\226\128\148")
         editorPanel.yValue:SetText("\226\128\148")
+        if editorPanel.linkButton then
+            editorPanel.linkButton:SetText("Link")
+        end
     end
 end
 
@@ -862,6 +1103,8 @@ function addon:HideAllEditableFrames(refresh)
     end
     local L = addon.L
     print("|cFF00FF00[DragonUI]|r " .. (L and L["All editable frames hidden, positions saved"] or "All editable frames hidden, positions saved"))
+    -- Clear snap groups: they are session-only and must not persist between editor sessions
+    ClearAllSnapGroups()
 end
 
 -- Check if a frame should be visible
